@@ -1,0 +1,144 @@
+import numpy as np
+import pandas as pd
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline import CustomFactor
+from quantopian.pipeline.filters import Q500US, Q1500US
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.algorithm import attach_pipeline, pipeline_output
+
+
+# ~~~~~~~~~~~~~~~~~~~~ Initializations and Definitions ~~~~~~~~~~~~~~~~~~~~ #
+
+
+def initialize(context):
+    # Registers pipeline
+    build_pipeline()
+    # Local extremum interval size in trading days.
+    context.sampling_interval_days = 2
+    # Rolling interval given some number of trading days; at local resolution (390 trading minutes in a trading day).
+    context.num_days = 10
+    context.interval_bounds = [390*x for x in range(context.num_days+1)]
+    context.intervals = [range(context.interval_bounds[i], context.interval_bounds[i+context.sampling_interval_days]+1) for i in range(len(context.interval_bounds)-2)]
+    # Evaluation Frequency: daily.
+    context.check_frequency = date_rules.every_day()
+    # Time of day for making trades.
+    context.trade_time = time_rules.market_open()
+    # Rebalances portfolio position at some regular frequency.
+    schedule_function(rebalance, context.check_frequency, context.trade_time)
+
+    
+# Custom Pipeline factor; computes gradient of asset prices over some interval.
+class Gradient(CustomFactor):
+    def compute(self, today, assets, out, data):
+        out[:] = np.gradient(data)[0][0]
+
+        
+# Constructs a pipeline of assets masked by market cap and factored/filtered by positive gradient over 10 preceding trading days.
+def build_pipeline():
+    # Instantiates the Gradient factor with mask.
+    grad_10 = Gradient(inputs = [USEquityPricing.close], window_length = 10, mask = Q500US())
+    pipe = Pipeline(columns = {'grad_10' : grad_10})
+    # Constructs and applies a filter by a positive gradient above some threshold.
+    uptrending = (grad_10 > .5)
+    pipe.set_screen(uptrending)
+    pipe = attach_pipeline(pipe, name = 'constrained_assets')
+    return pipe
+
+   
+# ~~~~~~~~~~~~~~~~~~~~ Core Data Analysis Subroutines ~~~~~~~~~~~~~~~~~~~~~~ #  
+    
+    
+def trend_evaluation(context, data):
+    
+    ''' 
+    Function executed at some regular frequency which fits trend lines (min, mean, max) on the (date, price) data using a polynomial regression of specified degree.
+    '''
+    
+    # Pulls price data indexed by DateTime at minute resolution.
+    hist = data.history(context.pipe_out.index, 'price', 390*context.num_days, '1m')
+    # Saves DateTime indices.
+    context.dates = hist.index
+    # Re-indexes the price data from DateTimes to be simply the integer number of minutes elapsed from the start of the rolling interval.
+    hist.index = range(390*context.num_days)
+    # Slices the price data by date into local dateTime intervals of previously specified size. 
+    hist_slices = [hist[context.intervals[i][0] : context.intervals[i][-1]] for i in range(len(context.intervals))]
+    hist_slice_indices = range(len(hist_slices))
+    # Determines extrema and mean values for each local interval.
+    maxima = [[hist_slices[i].idxmax(), hist_slices[i].max()] for i in hist_slice_indices]  
+    minima = [[hist_slices[i].idxmin(), hist_slices[i].min()] for i in hist_slice_indices]
+    means = [hist_slices[i].mean() for i in hist_slice_indices]
+    means = [[means[i][j] for i in hist_slice_indices] for j in range(len(context.pipe_out))]
+    context.moving_avg = [np.mean(means[i]) for i in range(len(context.pipe_out))]
+    # Performs polynomial (currently linear) regressions on the maxima, minima, and means to generate max, min, and mean trend line functions.
+    context.max_trends = [np.polynomial.polynomial.polyfit([maxima[i][0][k] for i in range(len(context.intervals))], [maxima[j][1][k] for j in range(len(context.intervals))], 1) for k in range(len(context.pipe_out))]
+    context.min_trends = [np.polynomial.polynomial.polyfit([minima[i][0][k] for i in range(len(context.intervals))], [minima[j][1][k] for j in range(len(context.intervals))], 1) for k in range(len(context.pipe_out))]
+    context.mean_trends = [np.polynomial.polynomial.polyfit(context.interval_bounds[1:-1], means[i], 1) for i in range(len(context.pipe_out))] 
+
+
+# Checks whether the min/max trend lines converge for each security and whether the extrapolated returns for each security are sufficiently positive; preserves any which fulfill both criteria.
+def uptrending_convergence_checker(index, context, data):
+    con_coords = []
+    slopes = [] 
+    for i in index:
+        x = (context.max_trends[i][0] - context.min_trends[i][0])/(context.min_trends[i][1] - context.max_trends[i][1])
+        if(x>0 and context.mean_trends[i][1]>.5):
+            con_coords.append([i,x])
+            slopes.append([i,context.mean_trends[i][1]])
+    return con_coords, slopes
+
+
+# Computes weighting coefficients for each convergent and positively trending security; timescale of convergence for coefficient 'c', expected return over the timescale for coefficient 'r'. Computes an overall weighting factor for each desired security and returns a list of normalized factors.
+def compute_weights(context, data):
+    convergences, returnz = uptrending_convergence_checker(range(len(context.max_trends)), context, data)
+    c_coeffs = [abs(1-(convergences[i][1]/(390*context.num_days))) for i in range(len(convergences))]
+    r_coeffs = [(returnz[i][1])*(390*context.num_days)/(context.moving_avg[i]) for i in range(len(returnz))]
+    raw_weights = [(c_coeffs[i]+r_coeffs[i]) for i in range(len(convergences))]
+    normalized_weights = [[convergences[i][0], raw_weights[i]/sum(raw_weights)] for i in range(len(raw_weights))]
+    return normalized_weights
+
+
+# ~~~~~~~~~~~~~~~~~~~ Regularly Scheduled Functions ~~~~~~~~~~~~~~~~~~~ #
+
+
+# Rebalances size of positions in portfolio based on weighting factors.
+def rebalance(context, data):
+    trend_evaluation(context, data)
+    weights = compute_weights(context, data)
+    print sum(weights)
+    context.weights = pd.Series([weights[i][1] for i in range(len(weights))], index = [context.pipe_out.index[j] for j in [weights[k][0] for k in range(len(weights))]])
+    open_orders = get_open_orders()
+    print context.weights.keys()
+    for i in range(len(context.weights)):
+        if context.weights.keys()[i] not in open_orders and data.can_trade(context.weights.keys()[i]):
+            order_target_percent(context.weights.keys()[i], context.weights[i])
+            
+            
+# Stores output from pipeline for global usage before trading start each day.       
+def before_trading_start(context, data):
+    output = pipeline_output('constrained_assets')
+    context.pipe_out = output
+    
+def safety_check(context, data):
+    open_orders = get_open_orders()
+    print context.weights.keys()
+    if context.weights.keys() != 0 :
+        for i in range(len(context.weights)):
+            drop = data.history(context.weights.keys()[i], 'price', 2, '1d')[0] - data.current(context.weights.keys()[i], 'price')
+            if(drop > 2*context.weights.std()[i] and context.weights.keys()[i] not in open_orders and data.can_trade(context.weights.keys()[i])): 
+                context.weights.remove(context.weights[i])
+                order_target_percent(context.weights.keys()[i], 0)
+           
+# Function which is automatically executed once a minute.
+#def handle_data(context, data):
+#    safety_check(context, data)   
+#        for i in range(len(context.weights)):
+#            drop = data.history(context.weights.keys()[i], 'price', 2, '1d')[0] - data.current(context.weights.keys()[i], 'price')
+#            if(drop > 2*context.weights.std()[i] and context.weights.keys()[i] not in open_orders and data.can_trade(context.weights.keys()[i])): 
+#                context.weights.remove(context.weights[i])
+#                order_target_percent(context.weights.keys()[i], 0)
+           
+# Function which is automatically executed once a minute.
+#def handle_data(context, data):
+#    safety_check(context, data)   
+
+    
