@@ -60,7 +60,7 @@ def trend_evaluation(context, data):
     context.dates = hist.index
     # Re-indexes the price data from DateTimes to be simply the integer number of minutes elapsed from the start of the rolling interval.
     hist.index = range(390*context.num_days)
-    # Slices the price data by date into local dateTime intervals of previously specified size. 
+    # Slices the price data by date into local DateTime intervals of previously specified size. 
     hist_slices = [hist[context.intervals[i][0] : context.intervals[i][-1]] for i in range(len(context.intervals))]
     hist_slice_indices = range(len(hist_slices))
     # Determines extrema and mean values for each local interval.
